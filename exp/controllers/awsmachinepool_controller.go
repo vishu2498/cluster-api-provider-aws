@@ -20,7 +20,10 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"time"
 
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/go-logr/logr"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/pkg/errors"
@@ -30,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -172,19 +176,25 @@ func (r *AWSMachinePoolReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		}
 	}()
 
+	// Patch now so that the status and selectors are available.
+	awsMachinePool.Status.InfrastructureMachineKind = "AWSMachine"
+	if err := machinePoolScope.PatchObject(); err != nil {
+		return ctrl.Result{}, errors.Wrap(err, "failed to patch AWSMachinePool status")
+	}
+
 	switch infraScope := infraCluster.(type) {
 	case *scope.ManagedControlPlaneScope:
 		if !awsMachinePool.ObjectMeta.DeletionTimestamp.IsZero() {
-			return ctrl.Result{}, r.reconcileDelete(machinePoolScope, infraScope, infraScope)
+			return ctrl.Result{}, r.reconcileDelete(ctx, machinePoolScope, infraScope, infraScope)
 		}
 
-		return ctrl.Result{}, r.reconcileNormal(ctx, machinePoolScope, infraScope, infraScope)
+		return r.reconcileNormal(ctx, machinePoolScope, infraScope, infraScope)
 	case *scope.ClusterScope:
 		if !awsMachinePool.ObjectMeta.DeletionTimestamp.IsZero() {
-			return ctrl.Result{}, r.reconcileDelete(machinePoolScope, infraScope, infraScope)
+			return ctrl.Result{}, r.reconcileDelete(ctx, machinePoolScope, infraScope, infraScope)
 		}
 
-		return ctrl.Result{}, r.reconcileNormal(ctx, machinePoolScope, infraScope, infraScope)
+		return r.reconcileNormal(ctx, machinePoolScope, infraScope, infraScope)
 	default:
 		return ctrl.Result{}, errors.New("infraCluster has unknown type")
 	}
@@ -202,7 +212,7 @@ func (r *AWSMachinePoolReconciler) SetupWithManager(ctx context.Context, mgr ctr
 		Complete(r)
 }
 
-func (r *AWSMachinePoolReconciler) reconcileNormal(ctx context.Context, machinePoolScope *scope.MachinePoolScope, clusterScope cloud.ClusterScoper, ec2Scope scope.EC2Scope) error {
+func (r *AWSMachinePoolReconciler) reconcileNormal(ctx context.Context, machinePoolScope *scope.MachinePoolScope, clusterScope cloud.ClusterScoper, ec2Scope scope.EC2Scope) (ctrl.Result, error) {
 	clusterScope.Info("Reconciling AWSMachinePool")
 
 	// If the AWSMachine is in an error state, return early.
@@ -211,28 +221,28 @@ func (r *AWSMachinePoolReconciler) reconcileNormal(ctx context.Context, machineP
 
 		// TODO: If we are in a failed state, delete the secret regardless of instance state
 
-		return nil
+		return ctrl.Result{}, nil
 	}
 
 	// If the AWSMachinepool doesn't have our finalizer, add it
 	if controllerutil.AddFinalizer(machinePoolScope.AWSMachinePool, expinfrav1.MachinePoolFinalizer) {
 		// Register finalizer immediately to avoid orphaning AWS resources
 		if err := machinePoolScope.PatchObject(); err != nil {
-			return err
+			return ctrl.Result{}, err
 		}
 	}
 
 	if !machinePoolScope.Cluster.Status.InfrastructureReady {
 		machinePoolScope.Info("Cluster infrastructure is not ready yet")
 		conditions.MarkFalse(machinePoolScope.AWSMachinePool, expinfrav1.ASGReadyCondition, infrav1.WaitingForClusterInfrastructureReason, clusterv1.ConditionSeverityInfo, "")
-		return nil
+		return ctrl.Result{}, nil
 	}
 
 	// Make sure bootstrap data is available and populated
 	if machinePoolScope.MachinePool.Spec.Template.Spec.Bootstrap.DataSecretName == nil {
 		machinePoolScope.Info("Bootstrap data secret reference is not yet available")
 		conditions.MarkFalse(machinePoolScope.AWSMachinePool, expinfrav1.ASGReadyCondition, infrav1.WaitingForBootstrapDataReason, clusterv1.ConditionSeverityInfo, "")
-		return nil
+		return ctrl.Result{}, nil
 	}
 
 	ec2Svc := r.getEC2Service(ec2Scope)
@@ -243,7 +253,7 @@ func (r *AWSMachinePoolReconciler) reconcileNormal(ctx context.Context, machineP
 	asg, err := r.findASG(machinePoolScope, asgsvc)
 	if err != nil {
 		conditions.MarkUnknown(machinePoolScope.AWSMachinePool, expinfrav1.ASGReadyCondition, expinfrav1.ASGNotFoundReason, err.Error())
-		return err
+		return ctrl.Result{}, err
 	}
 
 	canUpdateLaunchTemplate := func() (bool, error) {
@@ -283,7 +293,7 @@ func (r *AWSMachinePoolReconciler) reconcileNormal(ctx context.Context, machineP
 	if err := reconSvc.ReconcileLaunchTemplate(machinePoolScope, ec2Svc, canUpdateLaunchTemplate, runPostLaunchTemplateUpdateOperation); err != nil {
 		r.Recorder.Eventf(machinePoolScope.AWSMachinePool, corev1.EventTypeWarning, "FailedLaunchTemplateReconcile", "Failed to reconcile launch template: %v", err)
 		machinePoolScope.Error(err, "failed to reconcile launch template")
-		return err
+		return ctrl.Result{}, err
 	}
 
 	// set the LaunchTemplateReady condition
@@ -293,9 +303,28 @@ func (r *AWSMachinePoolReconciler) reconcileNormal(ctx context.Context, machineP
 		// Create new ASG
 		if err := r.createPool(machinePoolScope, clusterScope); err != nil {
 			conditions.MarkFalse(machinePoolScope.AWSMachinePool, expinfrav1.ASGReadyCondition, expinfrav1.ASGProvisionFailedReason, clusterv1.ConditionSeverityError, err.Error())
-			return err
+			return ctrl.Result{}, err
 		}
-		return nil
+		return ctrl.Result{
+			RequeueAfter: 15 * time.Second,
+		}, nil
+	}
+
+	awsMachineList, err := getAWSMachines(ctx, machinePoolScope.MachinePool, r.Client)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if err := createAWSMachinesIfNotExists(ctx, awsMachineList, machinePoolScope.MachinePool, &machinePoolScope.AWSMachinePool.ObjectMeta, &machinePoolScope.AWSMachinePool.TypeMeta, asg, machinePoolScope.GetLogger(), r.Client, ec2Svc); err != nil {
+		machinePoolScope.SetNotReady()
+		conditions.MarkFalse(machinePoolScope.AWSMachinePool, clusterv1.ReadyCondition, expinfrav1.AWSMachineCreationFailed, clusterv1.ConditionSeverityWarning, "%s", err.Error())
+		return ctrl.Result{}, fmt.Errorf("failed to create awsmachines: %w", err)
+	}
+
+	if err := deleteOrphanedAWSMachines(ctx, awsMachineList, asg, machinePoolScope.GetLogger(), r.Client); err != nil {
+		machinePoolScope.SetNotReady()
+		conditions.MarkFalse(machinePoolScope.AWSMachinePool, clusterv1.ReadyCondition, expinfrav1.AWSMachineDeletionFailed, clusterv1.ConditionSeverityWarning, "%s", err.Error())
+		return ctrl.Result{}, fmt.Errorf("failed to clean up awsmachines: %w", err)
 	}
 
 	if annotations.ReplicasManagedByExternalAutoscaler(machinePoolScope.MachinePool) {
@@ -306,14 +335,14 @@ func (r *AWSMachinePoolReconciler) reconcileNormal(ctx context.Context, machineP
 				"external", asg.DesiredCapacity)
 			machinePoolScope.MachinePool.Spec.Replicas = asg.DesiredCapacity
 			if err := machinePoolScope.PatchCAPIMachinePoolObject(ctx); err != nil {
-				return err
+				return ctrl.Result{}, err
 			}
 		}
 	}
 
 	if err := r.updatePool(machinePoolScope, clusterScope, asg); err != nil {
 		machinePoolScope.Error(err, "error updating AWSMachinePool")
-		return err
+		return ctrl.Result{}, err
 	}
 
 	launchTemplateID := machinePoolScope.GetLaunchTemplateIDStatus()
@@ -330,7 +359,7 @@ func (r *AWSMachinePoolReconciler) reconcileNormal(ctx context.Context, machineP
 	}
 	err = reconSvc.ReconcileTags(machinePoolScope, resourceServiceToUpdate)
 	if err != nil {
-		return errors.Wrap(err, "error updating tags")
+		return ctrl.Result{}, errors.Wrap(err, "error updating tags")
 	}
 
 	// Make sure Spec.ProviderID is always set.
@@ -353,11 +382,19 @@ func (r *AWSMachinePoolReconciler) reconcileNormal(ctx context.Context, machineP
 		machinePoolScope.Error(err, "failed updating instances", "instances", asg.Instances)
 	}
 
-	return nil
+	return ctrl.Result{
+		// Regularly update `AWSMachine` objects, for example if ASG was scaled or refreshed instances
+		// TODO: Requeueing interval can be removed or prolonged once reconciliation of ASG EC2 instances
+		//       can be triggered by events.
+		RequeueAfter: 3 * time.Minute,
+	}, nil
 }
 
-func (r *AWSMachinePoolReconciler) reconcileDelete(machinePoolScope *scope.MachinePoolScope, clusterScope cloud.ClusterScoper, ec2Scope scope.EC2Scope) error {
+func (r *AWSMachinePoolReconciler) reconcileDelete(ctx context.Context, machinePoolScope *scope.MachinePoolScope, clusterScope cloud.ClusterScoper, ec2Scope scope.EC2Scope) error {
 	clusterScope.Info("Handling deleted AWSMachinePool")
+	if err := reconcileDeleteAWSMachines(ctx, machinePoolScope.MachinePool, r.Client, machinePoolScope.GetLogger()); err != nil {
+		return err
+	}
 
 	ec2Svc := r.getEC2Service(ec2Scope)
 	asgSvc := r.getASGService(clusterScope)
@@ -412,6 +449,173 @@ func (r *AWSMachinePoolReconciler) reconcileDelete(machinePoolScope *scope.Machi
 	// remove finalizer
 	controllerutil.RemoveFinalizer(machinePoolScope.AWSMachinePool, expinfrav1.MachinePoolFinalizer)
 
+	return nil
+}
+
+func reconcileDeleteAWSMachines(ctx context.Context, mp *expclusterv1.MachinePool, client client.Client, l logr.Logger) error {
+	awsMachineList, err := getAWSMachines(ctx, mp, client)
+	if err != nil {
+		return err
+	}
+	for i := range awsMachineList.Items {
+		awsMachine := awsMachineList.Items[i]
+		if awsMachine.DeletionTimestamp.IsZero() {
+			continue
+		}
+		logger := l.WithValues("awsmachine", klog.KObj(&awsMachine))
+		// delete the owner Machine resource for the AWSMachine so that CAPI can clean up gracefully
+		machine, err := util.GetOwnerMachine(ctx, client, awsMachine.ObjectMeta)
+		if err != nil {
+			logger.V(2).Info("Failed to get owner Machine", "err", err.Error())
+			continue
+		}
+
+		if err := client.Delete(ctx, machine); err != nil {
+			logger.V(2).Info("Failed to delete owner Machine", "err", err.Error())
+		}
+	}
+	return nil
+}
+
+func getAWSMachines(ctx context.Context, mp *expclusterv1.MachinePool, kubeClient client.Client) (*infrav1.AWSMachineList, error) {
+	awsMachineList := &infrav1.AWSMachineList{}
+	labels := map[string]string{
+		clusterv1.MachinePoolNameLabel: mp.Name,
+		clusterv1.ClusterNameLabel:     mp.Spec.ClusterName,
+	}
+	if err := kubeClient.List(ctx, awsMachineList, client.InNamespace(mp.Namespace), client.MatchingLabels(labels)); err != nil {
+		return nil, err
+	}
+	return awsMachineList, nil
+}
+
+func createAWSMachinesIfNotExists(ctx context.Context, awsMachineList *infrav1.AWSMachineList, mp *expclusterv1.MachinePool, infraMachinePoolMeta *metav1.ObjectMeta, infraMachinePoolType *metav1.TypeMeta, existingASG *expinfrav1.AutoScalingGroup, l logr.Logger, client client.Client, ec2Svc services.EC2Interface) error {
+	l.V(4).Info("Creating missing AWSMachines")
+
+	providerIDToAWSMachine := make(map[string]infrav1.AWSMachine, len(awsMachineList.Items))
+	for i := range awsMachineList.Items {
+		awsMachine := awsMachineList.Items[i]
+		if awsMachine.Spec.ProviderID == nil || *awsMachine.Spec.ProviderID == "" {
+			continue
+		}
+		providerID := *awsMachine.Spec.ProviderID
+		providerIDToAWSMachine[providerID] = awsMachine
+	}
+
+	for i := range existingASG.Instances {
+		instanceID := existingASG.Instances[i].ID
+		providerID := fmt.Sprintf("aws:///%s/%s", existingASG.Instances[i].AvailabilityZone, instanceID)
+
+		instanceLogger := l.WithValues("providerID", providerID, "instanceID", instanceID, "asg", existingASG.Name)
+		instanceLogger.V(4).Info("Checking if machine pool AWSMachine is up to date")
+		if _, exists := providerIDToAWSMachine[providerID]; exists {
+			continue
+		}
+
+		instance, err := ec2Svc.InstanceIfExists(&instanceID)
+		if errors.Is(err, ec2.ErrInstanceNotFoundByID) {
+			instanceLogger.V(4).Info("Instance not found, it may have already been deleted")
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("failed to look up EC2 instance %q: %w", instanceID, err)
+		}
+
+		securityGroups := make([]infrav1.AWSResourceReference, 0, len(instance.SecurityGroupIDs))
+		for j := range instance.SecurityGroupIDs {
+			securityGroups = append(securityGroups, infrav1.AWSResourceReference{
+				ID: aws.String(instance.SecurityGroupIDs[j]),
+			})
+		}
+
+		awsMachine := &infrav1.AWSMachine{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:    mp.Namespace,
+				GenerateName: fmt.Sprintf("%s-", existingASG.Name),
+				Labels: map[string]string{
+					clusterv1.MachinePoolNameLabel: mp.Name,
+					clusterv1.ClusterNameLabel:     mp.Spec.ClusterName,
+				},
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						APIVersion:         infraMachinePoolType.APIVersion,
+						Kind:               infraMachinePoolType.Kind,
+						Name:               infraMachinePoolMeta.Name,
+						BlockOwnerDeletion: ptr.To(true),
+						UID:                infraMachinePoolMeta.UID,
+					},
+				},
+			},
+			Spec: infrav1.AWSMachineSpec{
+				ProviderID: aws.String(providerID),
+				InstanceID: aws.String(instanceID),
+
+				// Store some extra fields for informational purposes (not needed by CAPA)
+				AMI: infrav1.AMIReference{
+					ID: aws.String(instance.ImageID),
+				},
+				InstanceType:             instance.Type,
+				PublicIP:                 aws.Bool(instance.PublicIP != nil),
+				SSHKeyName:               instance.SSHKeyName,
+				InstanceMetadataOptions:  instance.InstanceMetadataOptions,
+				IAMInstanceProfile:       instance.IAMProfile,
+				AdditionalSecurityGroups: securityGroups,
+				Subnet:                   &infrav1.AWSResourceReference{ID: aws.String(instance.SubnetID)},
+				RootVolume:               instance.RootVolume,
+				NonRootVolumes:           instance.NonRootVolumes,
+				NetworkInterfaces:        instance.NetworkInterfaces,
+				CloudInit:                infrav1.CloudInit{},
+				SpotMarketOptions:        instance.SpotMarketOptions,
+				Tenancy:                  instance.Tenancy,
+			},
+		}
+		instanceLogger.V(4).Info("Creating AWSMachine")
+		if err := client.Create(ctx, awsMachine); err != nil {
+			return fmt.Errorf("failed to create AWSMachine: %w", err)
+		}
+	}
+	return nil
+}
+
+func deleteOrphanedAWSMachines(ctx context.Context, awsMachineList *infrav1.AWSMachineList, existingASG *expinfrav1.AutoScalingGroup, l logr.Logger, client client.Client) error {
+	l.V(4).Info("Deleting orphaned AWSMachines")
+	providerIDToInstance := make(map[string]infrav1.Instance, len(existingASG.Instances))
+	for i := range existingASG.Instances {
+		providerID := fmt.Sprintf("aws:///%s/%s", existingASG.Instances[i].AvailabilityZone, existingASG.Instances[i].ID)
+		providerIDToInstance[providerID] = existingASG.Instances[i]
+	}
+
+	for i := range awsMachineList.Items {
+		awsMachine := awsMachineList.Items[i]
+		if awsMachine.Spec.ProviderID == nil || *awsMachine.Spec.ProviderID == "" {
+			continue
+		}
+
+		providerID := *awsMachine.Spec.ProviderID
+		if _, exists := providerIDToInstance[providerID]; exists {
+			continue
+		}
+
+		machine, err := util.GetOwnerMachine(ctx, client, awsMachine.ObjectMeta)
+		if err != nil {
+			return fmt.Errorf("failed to get owner Machine for %s/%s: %w", awsMachine.Namespace, awsMachine.Name, err)
+		}
+		machineLogger := l.WithValues("machine", klog.KObj(machine), "awsmachine", klog.KObj(&awsMachine), "ProviderID", providerID)
+		machineLogger.V(4).Info("Deleting orphaned Machine")
+		if machine == nil {
+			machineLogger.Info("No machine owner found for AWSMachine, deleting AWSMachine anyway.")
+			if err := client.Delete(ctx, &awsMachine); err != nil {
+				return fmt.Errorf("failed to delete orphan AWSMachine %s/%s: %w", awsMachine.Namespace, awsMachine.Name, err)
+			}
+			machineLogger.V(4).Info("Deleted AWSMachine")
+			continue
+		}
+
+		if err := client.Delete(ctx, machine); err != nil {
+			return fmt.Errorf("failed to delete orphan Machine %s/%s: %w", machine.Namespace, machine.Name, err)
+		}
+		machineLogger.V(4).Info("Deleted Machine")
+	}
 	return nil
 }
 
