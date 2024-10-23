@@ -50,6 +50,7 @@ import (
 	capierrors "sigs.k8s.io/cluster-api/errors"
 	expclusterv1 "sigs.k8s.io/cluster-api/exp/api/v1beta1"
 	"sigs.k8s.io/cluster-api/util/conditions"
+	"sigs.k8s.io/cluster-api/util/labels/format"
 	"sigs.k8s.io/cluster-api/util/patch"
 )
 
@@ -357,7 +358,7 @@ func TestAWSMachinePoolReconciler(t *testing.T) {
 						Namespace: ms.AWSMachinePool.Namespace,
 						Name:      "name-1",
 						Labels: map[string]string{
-							clusterv1.MachinePoolNameLabel: ms.MachinePool.Name,
+							clusterv1.MachinePoolNameLabel: format.MustFormatValue(ms.MachinePool.Name),
 							clusterv1.ClusterNameLabel:     ms.MachinePool.Spec.ClusterName,
 						},
 						OwnerReferences: []metav1.OwnerReference{
@@ -389,7 +390,7 @@ func TestAWSMachinePoolReconciler(t *testing.T) {
 						Namespace: ms.AWSMachinePool.Namespace,
 						Name:      "name-2",
 						Labels: map[string]string{
-							clusterv1.MachinePoolNameLabel: ms.MachinePool.Name,
+							clusterv1.MachinePoolNameLabel: format.MustFormatValue(ms.MachinePool.Name),
 							clusterv1.ClusterNameLabel:     ms.MachinePool.Spec.ClusterName,
 						},
 						OwnerReferences: []metav1.OwnerReference{
