@@ -123,6 +123,12 @@ func TestAWSMachinePoolReconciler(t *testing.T) {
 		g.Expect(testEnv.Create(ctx, awsMachinePool)).To(Succeed())
 		g.Expect(testEnv.Create(ctx, secret)).To(Succeed())
 
+		// Used in owner reference for AWSMachinePool AWSMachines
+		awsMachinePool.TypeMeta = metav1.TypeMeta{
+			APIVersion: expinfrav1.GroupVersion.String(),
+			Kind:       "AWSMachinePool",
+		}
+
 		cs, err = setupCluster("test-cluster")
 		g.Expect(err).To(BeNil())
 
