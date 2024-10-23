@@ -56,6 +56,7 @@ import (
 	"sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/annotations"
 	"sigs.k8s.io/cluster-api/util/conditions"
+	"sigs.k8s.io/cluster-api/util/labels/format"
 	"sigs.k8s.io/cluster-api/util/predicates"
 )
 
@@ -533,7 +534,7 @@ func createAWSMachinesIfNotExists(ctx context.Context, awsMachineList *infrav1.A
 				Namespace:    mp.Namespace,
 				GenerateName: fmt.Sprintf("%s-", existingASG.Name),
 				Labels: map[string]string{
-					clusterv1.MachinePoolNameLabel: mp.Name,
+					clusterv1.MachinePoolNameLabel: format.MustFormatValue(mp.Name),
 					clusterv1.ClusterNameLabel:     mp.Spec.ClusterName,
 				},
 				OwnerReferences: []metav1.OwnerReference{
